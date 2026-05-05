@@ -50,6 +50,46 @@ const SEED_CANDIDATES_DEFAULT = [
 ];
 
 // ============================================================
+// レート制限管理（ITPM枠を自前で監視）
+// ============================================================
+
+class RateLimiter {
+  constructor(limit, windowMs) {
+    this.limit = limit;       // ITPM上限
+    this.windowMs = windowMs; // ウィンドウ（60秒）
+    this.history = [];        // {timestamp, tokens}
+  }
+  cleanup() {
+    const cutoff = Date.now() - this.windowMs;
+    this.history = this.history.filter(h => h.timestamp > cutoff);
+  }
+  currentUsage() {
+    this.cleanup();
+    return this.history.reduce((sum, h) => sum + h.tokens, 0);
+  }
+  async waitForBudget(estimated, onWait) {
+    while (true) {
+      this.cleanup();
+      const current = this.currentUsage();
+      if (current + estimated <= this.limit) return;
+      const oldest = this.history[0];
+      if (!oldest) return;
+      const waitMs = Math.max((oldest.timestamp + this.windowMs) - Date.now() + 500, 1000);
+      onWait?.(current, this.limit, waitMs);
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
+  record(tokens) {
+    this.history.push({ timestamp: Date.now(), tokens });
+  }
+}
+
+// Tier 1: ITPM 30,000 → 安全マージン85%で運用
+const inputLimiter = new RateLimiter(25000, 60000);
+
+let onRateLimitWait = null; // UIにログ出すためのフック
+
+// ============================================================
 // localStorage ヘルパー
 // ============================================================
 
@@ -145,6 +185,12 @@ async function callClaudeForJSON({ section, userVars, useWebSearch = false, maxT
     return await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) });
   }
 
+  // システムプロンプト + ユーザープロンプトの推定トークン数（日本語は約3文字/トークン）
+  const estimatedInput = Math.ceil((SYSTEM_PROMPT.length + userPrompt.length) / 3);
+  await inputLimiter.waitForBudget(estimatedInput, (current, limit, waitMs) => {
+    onRateLimitWait?.(`ITPM枠待機中 (${current}/${limit}トークン使用中、約${Math.ceil(waitMs/1000)}秒待つ)`);
+  });
+
   let resp;
   try { resp = await doFetch(); }
   catch (e) { return { error: `通信エラー: ${e.message}` }; }
@@ -152,11 +198,11 @@ async function callClaudeForJSON({ section, userVars, useWebSearch = false, maxT
   if (!resp.ok) {
     const errText = await resp.text().catch(() => "");
     if (resp.status === 429) {
-      // Anthropicのretry-afterヘッダを参照して正確に待つ。なければ60秒
       let lastErrText = errText;
       for (let attempt = 0; attempt < 3; attempt++) {
         const retryAfter = resp.headers.get("retry-after");
         const waitMs = retryAfter ? Math.min(parseFloat(retryAfter) * 1000, 90000) : 60000;
+        onRateLimitWait?.(`429受信、${Math.ceil(waitMs/1000)}秒待機して再試行`);
         await new Promise(r => setTimeout(r, waitMs + 1000));
         try {
           resp = await doFetch();
@@ -176,6 +222,19 @@ async function callClaudeForJSON({ section, userVars, useWebSearch = false, maxT
   let data;
   try { data = await resp.json(); }
   catch (e) { return { error: `JSON解析失敗: ${e.message}` }; }
+
+  // 実際に使ったトークン数をrate limiterに記録
+  // sonnet-4-6では cache_read は ITPM にカウントされない（公式ドキュメント確認済み）
+  const usage = data.usage || {};
+  const cacheCreate = usage.cache_creation_input_tokens || 0;
+  const cacheRead = usage.cache_read_input_tokens || 0;
+  const regularInput = usage.input_tokens || 0;
+  const itpmCounted = cacheCreate + regularInput; // cacheReadは除外
+  const totalInput = cacheCreate + cacheRead + regularInput;
+  inputLimiter.record(itpmCounted);
+  if (cacheCreate > 0 || cacheRead > 0) {
+    onRateLimitWait?.(`使用: 通常${regularInput}+キャッシュ作成${cacheCreate}+読込${cacheRead}=合計${totalInput}（ITPM計上${itpmCounted}）`);
+  }
 
   const textBlocks = (data.content || []).filter(b => b.type === "text").map(b => b.text);
   if (textBlocks.length === 0) return { error: "レスポンスにテキストブロックがありません" };
@@ -802,6 +861,7 @@ function AddView({ onCancel, onAdded, useWebSearch, setUseWebSearch }) {
     if (!name.trim()) return;
     setBusy(true); setLog([]);
     addLog(`「${name}」を生成開始（Web検索: ${useWebSearch ? "ON" : "OFF"}）`);
+    onRateLimitWait = (msg) => addLog(`  ⓘ ${msg}`);
     try {
       const result = await generateFullTerm(name.trim(), useWebSearch, (p) => {
         addLog(`${p.section}: ${p.status}${p.error ? ` (${p.error})` : ""}`, p.status === "error");
@@ -810,7 +870,7 @@ function AddView({ onCancel, onAdded, useWebSearch, setUseWebSearch }) {
       addLog("完了！");
       setTimeout(() => onAdded(result.term), 500);
     } catch (e) { addLog("例外: " + e.message, true); }
-    finally { setBusy(false); }
+    finally { onRateLimitWait = null; setBusy(false); }
   }
 
   return (
@@ -883,6 +943,7 @@ function SeedView({ existingTerms, onCancel, onTermAdded, useWebSearch, setUseWe
     if (names.length === 0) return;
     setBusy(true); setLog([]); setDoneCount(0); setTotalCount(names.length);
     addLog(`${names.length}件の処理開始（Web検索: ${useWebSearch ? "ON" : "OFF"}）`);
+    onRateLimitWait = (msg) => addLog(`  ⓘ ${msg}`);
 
     for (let i = 0; i < names.length; i++) {
       const n = names[i];
@@ -903,6 +964,7 @@ function SeedView({ existingTerms, onCancel, onTermAdded, useWebSearch, setUseWe
       setDoneCount(i + 1);
     }
     addLog("全処理完了");
+    onRateLimitWait = null;
     setBusy(false);
   }
 
