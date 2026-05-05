@@ -81,25 +81,35 @@ function setApiKeyLS(key) {
 
 function extractJSON(text) {
   const cleaned = text.replace(/```json\s*|\s*```/g, "").trim();
-  const startIdx = cleaned.indexOf("{");
-  if (startIdx === -1) return null;
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  for (let i = startIdx; i < cleaned.length; i++) {
-    const ch = cleaned[i];
-    if (escape) { escape = false; continue; }
-    if (inString) {
-      if (ch === "\\") { escape = true; continue; }
-      if (ch === '"') { inString = false; continue; }
-      continue;
+  // 全ての { を起点に、波括弧カウント方式でJSONを探す
+  // 末尾近くのものから順に試す（LLMは前置き→JSONの順で返すことが多いため）
+  const candidates = [];
+  for (let start = 0; start < cleaned.length; start++) {
+    if (cleaned[start] !== "{") continue;
+    let depth = 0, inString = false, escape = false;
+    for (let i = start; i < cleaned.length; i++) {
+      const ch = cleaned[i];
+      if (escape) { escape = false; continue; }
+      if (inString) {
+        if (ch === "\\") { escape = true; continue; }
+        if (ch === '"') { inString = false; continue; }
+        continue;
+      }
+      if (ch === '"') { inString = true; continue; }
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          candidates.push(cleaned.slice(start, i + 1));
+          break;
+        }
+      }
     }
-    if (ch === '"') { inString = true; continue; }
-    if (ch === "{") depth++;
-    else if (ch === "}") {
-      depth--;
-      if (depth === 0) return cleaned.slice(startIdx, i + 1);
-    }
+  }
+  // 大きいJSON（通常は中身のあるもの）から試す
+  candidates.sort((a, b) => b.length - a.length);
+  for (const c of candidates) {
+    try { return JSON.parse(c); } catch (e) {}
   }
   return null;
 }
@@ -162,11 +172,8 @@ async function callClaudeForJSON({ userPrompt, systemPrompt, useWebSearch = fals
   if (textBlocks.length === 0) return { error: "レスポンスにテキストブロックがありません" };
 
   for (const text of [...textBlocks].reverse()) {
-    const jsonStr = extractJSON(text);
-    if (jsonStr) {
-      try { return { data: JSON.parse(jsonStr) }; }
-      catch (e) {}
-    }
+    const parsed = extractJSON(text);
+    if (parsed) return { data: parsed };
   }
   return { error: `JSONが見つからない。先頭: ${textBlocks[0].slice(0, 100)}` };
 }
@@ -181,25 +188,22 @@ const SYS_TEXT = `竹中工務店の環境技術に詳しいPwCコンサルタ�
   "analogy": { "text": "150字以内の比喩・例え話", "basis": "hypothesis" }
 }`;
 
-const SYS_DIAGRAM = `技術の仕組み図解SVGを生成。JSONのみ返す。
+const SYS_DIAGRAM = `技術の仕組み図解SVGを生成。前置き・コードフェンス禁止。JSONのみ返す。
 
-{
-  "diagramSVG": "<svg viewBox='0 0 600 400' xmlns='http://www.w3.org/2000/svg'>...</svg>"
-}
+{ "diagramSVG": "<svg viewBox='0 0 600 400' xmlns='http://www.w3.org/2000/svg'>...</svg>" }
 
-【4パターンから最適なものを選ぶ】
-(A) 断面図 — 建材・外装・木造構造に最適。横方向に層を矩形で重ね、各層に日本語ラベル
-(B) プロセスフロー — CO2吸収・水処理・養生に最適。左→右に「投入物→プロセス→産出物」を矩形＋矢印
-(C) Before/After比較 — 性能差・改良技術に最適。中央縦線で「従来」「本技術」、上部に対比軸
-(D) サイクル図 — 循環・カーボン循環に最適。円形配置で4〜6要素を矢印で繋ぐ
+【4パターンから1つ選ぶ】
+A) 断面図 — 建材・木造に最適。横方向に層を矩形で重ね、各層に日本語ラベル
+B) プロセスフロー — CO2吸収・水処理・養生に最適。左→右に「投入物→プロセス→産出物」を矩形＋矢印
+C) Before/After — 性能差・改良技術に最適。中央縦線で「従来」「本技術」を左右配置
+D) サイクル図 — 循環・カーボン循環に最適。円形に4〜6要素を矢印で繋ぐ
 
-【厳守ルール】
-- viewBox は "0 0 600 400"
-- 最初に <rect x='0' y='0' width='600' height='400' fill='#fafaf9'/>
-- フォント：見出し18px、ラベル14px、注記12px
-- 色：メイン#1c1917、強調#059669、対比#dc2626、グレー#a8a29e、強調背景#dcfce7
-- 端から30px以上の余白、ラベルは重ねない
-- 上部中央にタイトル必須
+【ルール】
+- viewBox="0 0 600 400" 必須
+- 最初に <rect x="0" y="0" width="600" height="400" fill="#fafaf9"/>
+- フォント: 見出し18px / ラベル14px / 注記12px
+- 色: #1c1917 (メイン) / #059669 (強調) / #dc2626 (対比) / #a8a29e (グレー) / #dcfce7 (強調背景)
+- 上部中央にタイトル必須、ラベル重なり禁止、端から30px余白
 - rect/circle/line/path/polygon/text/marker のみ`;
 
 const SYS_COMPARE = `スーパーゼネコン4社（大林組・鹿島建設・清水建設・大成建設）の対応技術を比較。JSONのみ返す。
@@ -244,7 +248,7 @@ async function generateFullTerm(termName, useWebSearch, onProgress) {
     { key: "diagram", system: SYS_DIAGRAM, label: "①知る（図解）", maxTokens: 2500 },
     { key: "compare", system: SYS_COMPARE, label: "②比べる", maxTokens: 1500 },
     { key: "valuePitch", system: SYS_VALUE_PITCH, label: "③価値・⑤訴求", maxTokens: 800 },
-    { key: "future", system: SYS_FUTURE, label: "④未来", maxTokens: 1200 },
+    { key: "future", system: SYS_FUTURE, label: "④未来", maxTokens: 1800 },
   ];
 
   const results = [];
@@ -296,7 +300,7 @@ const MODIFIER_PROMPTS = {
 async function regenerateSection(termName, section, modifier, useWebSearch) {
   const userPrompt = `技術名: ${termName}\n\n指示: ${MODIFIER_PROMPTS[modifier]}`;
   const sysMap = { text: SYS_TEXT, diagram: SYS_DIAGRAM, compare: SYS_COMPARE, valuePitch: SYS_VALUE_PITCH, future: SYS_FUTURE };
-  const tokensMap = { text: 800, diagram: 2500, compare: 1500, valuePitch: 800, future: 1200 };
+  const tokensMap = { text: 800, diagram: 2500, compare: 1500, valuePitch: 800, future: 1800 };
   return await callClaudeForJSON({ userPrompt, systemPrompt: sysMap[section], useWebSearch, maxTokens: tokensMap[section] });
 }
 
