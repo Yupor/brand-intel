@@ -104,13 +104,13 @@ function extractJSON(text) {
   return null;
 }
 
-async function callClaudeForJSON({ userPrompt, systemPrompt, useWebSearch = false }) {
+async function callClaudeForJSON({ userPrompt, systemPrompt, useWebSearch = false, maxTokens = 2048 }) {
   const apiKey = getApiKey();
   if (!apiKey) return { error: "APIキーが設定されていません（右上「設定」から登録）" };
 
   const body = {
     model: "claude-sonnet-4-6",
-    max_tokens: 8192,
+    max_tokens: maxTokens,
     system: systemPrompt,
     messages: [{ role: "user", content: userPrompt }],
   };
@@ -135,19 +135,20 @@ async function callClaudeForJSON({ userPrompt, systemPrompt, useWebSearch = fals
   if (!resp.ok) {
     const errText = await resp.text().catch(() => "");
     if (resp.status === 429) {
-      const waits = [3000, 6000, 12000, 20000];
+      const waits = [10000, 30000, 60000];
+      let lastErrText = errText;
       for (let i = 0; i < waits.length; i++) {
         await new Promise(r => setTimeout(r, waits[i]));
         try {
           resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) });
           if (resp.ok) break;
+          lastErrText = await resp.text().catch(() => "");
           if (resp.status !== 429) {
-            const errText2 = await resp.text().catch(() => "");
-            return { error: `HTTP ${resp.status}: ${errText2.slice(0, 200)}` };
+            return { error: `HTTP ${resp.status}: ${lastErrText.slice(0, 200)}` };
           }
         } catch (e) { return { error: `リトライ時の通信エラー: ${e.message}` }; }
       }
-      if (!resp.ok) return { error: "429が複数回続きました。しばらく待って再実行を。" };
+      if (!resp.ok) return { error: `429が3回続きました（OTPM制限の可能性）。エラー詳細: ${lastErrText.slice(0, 200)}` };
     } else {
       return { error: `HTTP ${resp.status}: ${errText.slice(0, 200)}` };
     }
@@ -239,19 +240,19 @@ ESG情報開示・SBT・TCFD・脱炭素規制から2〜3シナリオ構築。`;
 async function generateFullTerm(termName, useWebSearch, onProgress) {
   const userPrompt = `技術名: ${termName}`;
   const sections = [
-    { key: "text", system: SYS_TEXT, label: "①知る（テキスト）" },
-    { key: "diagram", system: SYS_DIAGRAM, label: "①知る（図解）" },
-    { key: "compare", system: SYS_COMPARE, label: "②比べる" },
-    { key: "valuePitch", system: SYS_VALUE_PITCH, label: "③価値・⑤訴求" },
-    { key: "future", system: SYS_FUTURE, label: "④未来" },
+    { key: "text", system: SYS_TEXT, label: "①知る（テキスト）", maxTokens: 800 },
+    { key: "diagram", system: SYS_DIAGRAM, label: "①知る（図解）", maxTokens: 2500 },
+    { key: "compare", system: SYS_COMPARE, label: "②比べる", maxTokens: 1500 },
+    { key: "valuePitch", system: SYS_VALUE_PITCH, label: "③価値・⑤訴求", maxTokens: 800 },
+    { key: "future", system: SYS_FUTURE, label: "④未来", maxTokens: 1200 },
   ];
 
   const results = [];
   for (let i = 0; i < sections.length; i++) {
     const s = sections[i];
-    if (i > 0) await new Promise(r => setTimeout(r, 800));
+    if (i > 0) await new Promise(r => setTimeout(r, 5000));
     onProgress?.({ section: s.label, status: "running" });
-    const r = await callClaudeForJSON({ userPrompt, systemPrompt: s.system, useWebSearch });
+    const r = await callClaudeForJSON({ userPrompt, systemPrompt: s.system, useWebSearch, maxTokens: s.maxTokens });
     onProgress?.({ section: s.label, status: r.error ? "error" : "done", error: r.error });
     results.push({ key: s.key, ...r });
   }
@@ -295,7 +296,8 @@ const MODIFIER_PROMPTS = {
 async function regenerateSection(termName, section, modifier, useWebSearch) {
   const userPrompt = `技術名: ${termName}\n\n指示: ${MODIFIER_PROMPTS[modifier]}`;
   const sysMap = { text: SYS_TEXT, diagram: SYS_DIAGRAM, compare: SYS_COMPARE, valuePitch: SYS_VALUE_PITCH, future: SYS_FUTURE };
-  return await callClaudeForJSON({ userPrompt, systemPrompt: sysMap[section], useWebSearch });
+  const tokensMap = { text: 800, diagram: 2500, compare: 1500, valuePitch: 800, future: 1200 };
+  return await callClaudeForJSON({ userPrompt, systemPrompt: sysMap[section], useWebSearch, maxTokens: tokensMap[section] });
 }
 
 // ============================================================
