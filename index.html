@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>環境技術ブランディング・インテリジェンス</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", sans-serif; }
+    .serif { font-family: Georgia, "Times New Roman", "Yu Mincho", serif; }
+  </style>
+</head>
+<body class="bg-stone-50">
+  <div id="root"></div>
+  <script type="text/babel" data-presets="react">
+
+const { useState, useEffect, useMemo, useRef } = React;
+
+// ============================================================
+// 定数
+// ============================================================
+
+const STORAGE_KEY = "brand_intel_terms";
+const API_KEY_STORAGE = "anthropic_api_key";
+
+const CATEGORY_STYLES = {
+  "コンクリート系": "bg-stone-100 text-stone-800 border-stone-300",
+  "木造系": "bg-amber-50 text-amber-900 border-amber-300",
+  "緑化系": "bg-emerald-50 text-emerald-900 border-emerald-300",
+  "エネルギー系": "bg-sky-50 text-sky-900 border-sky-300",
+  "空調・換気系": "bg-violet-50 text-violet-900 border-violet-300",
+  "水・土壌系": "bg-blue-50 text-blue-900 border-blue-300",
+  "その他": "bg-gray-50 text-gray-800 border-gray-300",
+};
+
+const SEED_CANDIDATES_DEFAULT = [
+  "燃エンウッド",
+  "T-Wood Frame",
+  "バイオスキン",
+  "T-Light blade",
+  "アクアフェロー",
+  "エコクリート",
+  "T-Wave",
+  "CO2-SUICOM",
+  "屋上緑化システム",
+  "スマートZEB",
+];
+
+// ============================================================
+// localStorage ヘルパー
+// ============================================================
+
+function loadTerms() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) { return []; }
+}
+
+function saveAllTerms(terms) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(terms));
+  } catch (e) {
+    alert("保存失敗（localStorage容量上限の可能性）: " + e.message);
+  }
+}
+
+function getApiKey() {
+  return localStorage.getItem(API_KEY_STORAGE) || "";
+}
+function setApiKeyLS(key) {
+  localStorage.setItem(API_KEY_STORAGE, key);
+}
+
+// ============================================================
+// Anthropic API
+// ============================================================
+
+async function callClaudeForJSON({ userPrompt, systemPrompt, useWebSearch = false }) {
+  const apiKey = getApiKey();
+  if (!apiKey) return { error: "APIキーが設定されていません（右上「設定」から登録）" };
+
+  const body = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 2048,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userPrompt }],
+  };
+  if (useWebSearch) {
+    body.tools = [{ type: "web_search_20250305", name: "web_search" }];
+  }
+
+  const headers = {
+    "Content-Type": "application/json",
+    "x-api-key": apiKey,
+    "anthropic-version": "2023-06-01",
+    "anthropic-dangerous-direct-browser-access": "true",
+  };
+
+  let resp;
+  try {
+    resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) });
+  } catch (e) {
+    return { error: `通信エラー: ${e.message}` };
+  }
+
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => "");
+    if (resp.status === 429) {
+      const waits = [3000, 6000, 12000, 20000];
+      for (let i = 0; i < waits.length; i++) {
+        await new Promise(r => setTimeout(r, waits[i]));
+        try {
+          resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) });
+          if (resp.ok) break;
+          if (resp.status !== 429) {
+            const errText2 = await resp.text().catch(() => "");
+            return { error: `HTTP ${resp.status}: ${errText2.slice(0, 200)}` };
+          }
+        } catch (e) { return { error: `リトライ時の通信エラー: ${e.message}` }; }
+      }
+      if (!resp.ok) return { error: "429が複数回続きました。しばらく待って再実行を。" };
+    } else {
+      return { error: `HTTP ${resp.status}: ${errText.slice(0, 200)}` };
+    }
+  }
+
+  let data;
+  try { data = await resp.json(); }
+  catch (e) { return { error: `JSON解析失敗: ${e.message}` }; }
+
+  const textBlocks = (data.content || []).filter(b => b.type === "text").map(b => b.text);
+  if (textBlocks.length === 0) return { error: "レスポンスにテキストブロックがありません" };
+
+  for (const text of [...textBlocks].reverse()) {
+    const cleaned = text.replace(/```json\s*|\s*```/g, "").trim();
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (match) {
+      try { return { data: JSON.parse(match[0]) }; }
+      catch (e) {}
+    }
+  }
+  return { error: `JSONが見つからない。先頭: ${textBlocks[0].slice(0, 100)}` };
+}
+
+const SYS_TEXT = `竹中工務店の環境技術に詳しいPwCコンサルタント向けアシスタントとして、入力技術名についてJSONのみ返す。前置き・コードフェンス禁止。
+
+{
+  "name": "正式な技術名",
+  "reading": "読み",
+  "category": "コンクリート系|木造系|緑化系|エネルギー系|空調・換気系|水・土壌系|その他",
+  "definition": { "text": "180字以内の中立的な技術説明", "basis": "fact", "sources": [] },
+  "analogy": { "text": "150字以内の比喩・例え話", "basis": "hypothesis" }
+}`;
+
+const SYS_DIAGRAM = `技術の仕組み図解SVGを生成。JSONのみ返す。
+
+{
+  "diagramSVG": "<svg viewBox='0 0 600 400' xmlns='http://www.w3.org/2000/svg'>...</svg>"
+}
+
+【4パターンから最適なものを選ぶ】
+(A) 断面図 — 建材・外装・木造構造に最適。横方向に層を矩形で重ね、各層に日本語ラベル
+(B) プロセスフロー — CO2吸収・水処理・養生に最適。左→右に「投入物→プロセス→産出物」を矩形＋矢印
+(C) Before/After比較 — 性能差・改良技術に最適。中央縦線で「従来」「本技術」、上部に対比軸
+(D) サイクル図 — 循環・カーボン循環に最適。円形配置で4〜6要素を矢印で繋ぐ
+
+【厳守ルール】
+- viewBox は "0 0 600 400"
+- 最初に <rect x='0' y='0' width='600' height='400' fill='#fafaf9'/>
+- フォント：見出し18px、ラベル14px、注記12px
+- 色：メイン#1c1917、強調#059669、対比#dc2626、グレー#a8a29e、強調背景#dcfce7
+- 端から30px以上の余白、ラベルは重ねない
+- 上部中央にタイトル必須
+- rect/circle/line/path/polygon/text/marker のみ`;
+
+const SYS_COMPARE = `スーパーゼネコン4社（大林組・鹿島建設・清水建設・大成建設）の対応技術を比較。JSONのみ返す。
+
+{
+  "compare": [
+    { "company": "大林組", "tech": "対応技術名（無ければ「該当なし」）", "summary": "60字以内の特徴", "diff": "竹中との差分（60字以内）", "basis": "fact|hypothesis", "sources": [] },
+    { "company": "鹿島建設", ... },
+    { "company": "清水建設", ... },
+    { "company": "大成建設", ... }
+  ]
+}`;
+
+const SYS_VALUE_PITCH = `竹中の独自性・差別化軸・ブランディング訴求論点を整理。JSONのみ返す。
+
+{
+  "value": {
+    "uniqueness": "竹中の独自性（100字以内）",
+    "differentiator": "差別化軸を1行で",
+    "basis": "fact|hypothesis",
+    "sources": []
+  },
+  "pitch": ["論点1（50字以内、論点を投げかける形）", "論点2", "論点3"]
+}
+
+ピッチ案は「○○という訴求は成立するか？」など、判断のための論点提示。`;
+
+const SYS_FUTURE = `今後の需要シナリオを整理。JSONのみ返す。
+
+{
+  "future": [
+    { "scenario": "シナリオ名（10字程度）", "who": "誰が", "why": "なぜ需要が上がるか（80字以内）", "context": "具体的な引き合い文脈（80字以内）", "basis": "fact|hypothesis", "sources": [] }
+  ]
+}
+
+ESG情報開示・SBT・TCFD・脱炭素規制から2〜3シナリオ構築。`;
+
+async function generateFullTerm(termName, useWebSearch, onProgress) {
+  const userPrompt = `技術名: ${termName}`;
+  const sections = [
+    { key: "text", system: SYS_TEXT, label: "①知る（テキスト）" },
+    { key: "diagram", system: SYS_DIAGRAM, label: "①知る（図解）" },
+    { key: "compare", system: SYS_COMPARE, label: "②比べる" },
+    { key: "valuePitch", system: SYS_VALUE_PITCH, label: "③価値・⑤訴求" },
+    { key: "future", system: SYS_FUTURE, label: "④未来" },
+  ];
+
+  const results = [];
+  for (let i = 0; i < sections.length; i++) {
+    const s = sections[i];
+    if (i > 0) await new Promise(r => setTimeout(r, 800));
+    onProgress?.({ section: s.label, status: "running" });
+    const r = await callClaudeForJSON({ userPrompt, systemPrompt: s.system, useWebSearch });
+    onProgress?.({ section: s.label, status: r.error ? "error" : "done", error: r.error });
+    results.push({ key: s.key, ...r });
+  }
+
+  const text = results.find(r => r.key === "text")?.data;
+  if (!text) {
+    const textErr = results.find(r => r.key === "text")?.error;
+    return { error: `①知るのテキスト取得に失敗: ${textErr || "不明"}` };
+  }
+  const diagram = results.find(r => r.key === "diagram")?.data;
+  const compare = results.find(r => r.key === "compare")?.data;
+  const valuePitch = results.find(r => r.key === "valuePitch")?.data;
+  const future = results.find(r => r.key === "future")?.data;
+
+  return {
+    term: {
+      id: `term_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      name: text.name || termName,
+      reading: text.reading || "",
+      category: text.category || "その他",
+      tags: [],
+      know: { definition: text.definition, analogy: text.analogy, diagramSVG: diagram?.diagramSVG || "" },
+      compare: compare?.compare || [],
+      value: valuePitch?.value || null,
+      pitch: valuePitch?.pitch || [],
+      future: future?.future || [],
+      myMemo: "",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    },
+  };
+}
+
+const MODIFIER_PROMPTS = {
+  again: "別の表現で書き直してください。",
+  angle: "別の角度から再考してください。",
+  brand: "もっとブランディング担当者の感覚に響く表現にしてください。比喩・例え・連想を重視。",
+  simple: "もっと簡単に、専門用語を減らして書いてください。",
+};
+
+async function regenerateSection(termName, section, modifier, useWebSearch) {
+  const userPrompt = `技術名: ${termName}\n\n指示: ${MODIFIER_PROMPTS[modifier]}`;
+  const sysMap = { text: SYS_TEXT, diagram: SYS_DIAGRAM, compare: SYS_COMPARE, valuePitch: SYS_VALUE_PITCH, future: SYS_FUTURE };
+  return await callClaudeForJSON({ userPrompt, systemPrompt: sysMap[section], useWebSearch });
+}
+
+// ============================================================
+// 共通UI部品
+// ============================================================
+
+function BasisBadge({ basis, sources = [] }) {
+  if (basis === "fact") {
+    return <span className="inline-flex items-center gap-1 px-2 py-0.5 text-xs bg-emerald-50 text-emerald-800 border border-emerald-300 rounded">✓ 出典あり {sources?.length > 0 && `(${sources.length})`}</span>;
+  }
+  return <span className="inline-flex items-center gap-1 px-2 py-0.5 text-xs bg-amber-50 text-amber-800 border border-amber-300 rounded">💭 推論</span>;
+}
+
+function CategoryBadge({ category }) {
+  const cls = CATEGORY_STYLES[category] || CATEGORY_STYLES["その他"];
+  return <span className={`inline-block px-2 py-0.5 text-xs border rounded ${cls}`}>{category}</span>;
+}
+
+function TagChip({ tag, onRemove }) {
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 text-xs bg-stone-200 text-stone-800 rounded-full">
+      #{tag}
+      {onRemove && <button onClick={onRemove} className="text-stone-500 hover:text-stone-900 ml-1">×</button>}
+    </span>
+  );
+}
+
+function TagInput({ tags, onChange, allTags }) {
+  const [input, setInput] = useState("");
+  const suggestions = input.trim() ? allTags.filter(t => t.includes(input) && !tags.includes(t)).slice(0, 5) : [];
+  function addTag(tag) {
+    const trimmed = tag.trim();
+    if (trimmed && !tags.includes(trimmed)) onChange([...tags, trimmed]);
+    setInput("");
+  }
+  return (
+    <div>
+      <div className="flex flex-wrap gap-1 mb-2">
+        {tags.map(t => <TagChip key={t} tag={t} onRemove={() => onChange(tags.filter(x => x !== t))} />)}
+      </div>
+      <div className="relative">
+        <input value={input} onChange={e => setInput(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addTag(input); } }}
+          placeholder="タグを入力してEnter（例：竹中固有 / プレゼン候補 / 未理解）"
+          className="w-full px-3 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-stone-500" />
+        {suggestions.length > 0 && (
+          <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-stone-300 rounded shadow-sm z-10">
+            {suggestions.map(s => (
+              <button key={s} onClick={() => addTag(s)} className="block w-full text-left px-3 py-1.5 text-sm hover:bg-stone-50">#{s}</button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SourceLinks({ sources }) {
+  if (!sources || sources.length === 0) return null;
+  return (
+    <div className="mt-2 flex flex-wrap gap-2">
+      {sources.map((url, i) => (
+        <a key={i} href={url} target="_blank" rel="noopener noreferrer"
+          className="text-xs text-emerald-700 hover:text-emerald-900 underline truncate max-w-xs">
+          {(() => { try { return new URL(url).hostname; } catch { return url; } })()}
+        </a>
+      ))}
+    </div>
+  );
+}
+
+function RegenerateButtons({ onRegenerate, busy }) {
+  const buttons = [
+    { key: "again", label: "もう一回" }, { key: "angle", label: "別角度で" },
+    { key: "brand", label: "ブランド人向けに" }, { key: "simple", label: "もっと簡単に" },
+  ];
+  return (
+    <div className="mt-3 flex flex-wrap gap-2">
+      {buttons.map(b => (
+        <button key={b.key} onClick={() => onRegenerate(b.key)} disabled={busy}
+          className="px-3 py-1 text-xs bg-white text-stone-700 border border-stone-300 rounded hover:bg-stone-50 disabled:opacity-40">
+          {busy ? "生成中…" : b.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function WebSearchToggle({ value, onChange }) {
+  return (
+    <label className="flex items-center gap-2 text-sm text-stone-700 cursor-pointer">
+      <input type="checkbox" checked={value} onChange={e => onChange(e.target.checked)} className="rounded" />
+      <span>Web検索で裏取り（精度↑、時間 1件あたり +30〜60秒）</span>
+    </label>
+  );
+}
+
+function ProgressLog({ log }) {
+  if (log.length === 0) return null;
+  return (
+    <div className="mt-4 p-3 bg-stone-100 border border-stone-300 rounded text-xs font-mono max-h-48 overflow-y-auto">
+      {log.map((line, i) => (
+        <div key={i} className={line.error ? "text-red-700" : "text-stone-700"}>{line.time} · {line.text}</div>
+      ))}
+    </div>
+  );
+}
+
+// ============================================================
+// 5タブ
+// ============================================================
+
+function Tab1Know({ term, onRegenerate, busy }) {
+  const [subTab, setSubTab] = useState("definition");
+  const subs = [{ key: "definition", label: "定義" }, { key: "analogy", label: "例え話" }, { key: "diagram", label: "図解" }];
+  const k = term.know || {};
+  return (
+    <div>
+      <div className="flex gap-1 mb-4 border-b border-stone-200">
+        {subs.map(s => (
+          <button key={s.key} onClick={() => setSubTab(s.key)}
+            className={`px-4 py-2 text-sm border-b-2 -mb-px ${subTab === s.key ? "border-stone-900 text-stone-900 font-medium" : "border-transparent text-stone-500 hover:text-stone-800"}`}>
+            {s.label}
+          </button>
+        ))}
+      </div>
+      {subTab === "definition" && k.definition && (
+        <div>
+          <div className="mb-2"><BasisBadge basis={k.definition.basis} sources={k.definition.sources} /></div>
+          <p className="text-stone-800 leading-relaxed serif">{k.definition.text}</p>
+          <SourceLinks sources={k.definition.sources} />
+          <RegenerateButtons onRegenerate={(m) => onRegenerate("text", m)} busy={busy} />
+        </div>
+      )}
+      {subTab === "analogy" && k.analogy && (
+        <div>
+          <div className="mb-2"><BasisBadge basis={k.analogy.basis} /></div>
+          <p className="text-stone-800 leading-relaxed italic serif">{k.analogy.text}</p>
+          <RegenerateButtons onRegenerate={(m) => onRegenerate("text", m)} busy={busy} />
+        </div>
+      )}
+      {subTab === "diagram" && (
+        <div>
+          {k.diagramSVG ? (
+            <div className="bg-white border border-stone-200 rounded p-2" dangerouslySetInnerHTML={{ __html: k.diagramSVG }} />
+          ) : (
+            <div className="text-stone-500 text-sm p-8 text-center">図解はまだ生成されていません</div>
+          )}
+          <RegenerateButtons onRegenerate={(m) => onRegenerate("diagram", m)} busy={busy} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Tab2Compare({ term, onRegenerate, busy }) {
+  if (!term.compare || term.compare.length === 0) return <div className="text-stone-500">データなし</div>;
+  return (
+    <div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        {term.compare.map((c, i) => (
+          <div key={i} className="border border-stone-200 rounded p-4 bg-white">
+            <div className="flex justify-between items-start mb-2">
+              <h4 className="font-medium text-stone-900">{c.company}</h4>
+              <BasisBadge basis={c.basis} sources={c.sources} />
+            </div>
+            <div className="text-xs text-stone-500 mb-1">対応技術</div>
+            <div className="text-sm text-stone-800 mb-3">{c.tech}</div>
+            <div className="text-xs text-stone-500 mb-1">特徴</div>
+            <div className="text-sm text-stone-700 mb-3">{c.summary}</div>
+            <div className="text-xs text-stone-500 mb-1">竹中との差分</div>
+            <div className="text-sm text-stone-700 italic">{c.diff}</div>
+            <SourceLinks sources={c.sources} />
+          </div>
+        ))}
+      </div>
+      <RegenerateButtons onRegenerate={(m) => onRegenerate("compare", m)} busy={busy} />
+    </div>
+  );
+}
+
+function Tab3Value({ term, onRegenerate, busy }) {
+  const v = term.value;
+  if (!v) return <div className="text-stone-500">データなし</div>;
+  return (
+    <div>
+      <div className="mb-6 p-5 bg-emerald-50 border border-emerald-200 rounded">
+        <div className="text-xs text-emerald-800 mb-1 tracking-wider uppercase">差別化軸</div>
+        <div className="text-lg text-stone-900 font-medium serif">{v.differentiator}</div>
+      </div>
+      <div className="mb-2 flex items-center gap-2">
+        <h4 className="text-sm font-medium text-stone-700">竹中の独自性</h4>
+        <BasisBadge basis={v.basis} sources={v.sources} />
+      </div>
+      <p className="text-stone-800 leading-relaxed">{v.uniqueness}</p>
+      <SourceLinks sources={v.sources} />
+      <RegenerateButtons onRegenerate={(m) => onRegenerate("valuePitch", m)} busy={busy} />
+    </div>
+  );
+}
+
+function Tab4Future({ term, onRegenerate, busy }) {
+  if (!term.future || term.future.length === 0) return <div className="text-stone-500">データなし</div>;
+  return (
+    <div>
+      <div className="space-y-4">
+        {term.future.map((f, i) => (
+          <div key={i} className="border-l-4 border-sky-400 pl-4 py-2">
+            <div className="flex justify-between items-start mb-2">
+              <h4 className="font-medium text-stone-900 serif">{f.scenario}</h4>
+              <BasisBadge basis={f.basis} sources={f.sources} />
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+              <div><div className="text-xs text-stone-500 mb-1">誰が</div><div className="text-stone-800">{f.who}</div></div>
+              <div><div className="text-xs text-stone-500 mb-1">なぜ</div><div className="text-stone-800">{f.why}</div></div>
+              <div><div className="text-xs text-stone-500 mb-1">引き合い文脈</div><div className="text-stone-800">{f.context}</div></div>
+            </div>
+            <SourceLinks sources={f.sources} />
+          </div>
+        ))}
+      </div>
+      <RegenerateButtons onRegenerate={(m) => onRegenerate("future", m)} busy={busy} />
+    </div>
+  );
+}
+
+function Tab5Pitch({ term, onMemoChange, onRegenerate, busy }) {
+  return (
+    <div>
+      <div className="mb-6">
+        <h4 className="text-sm font-medium text-stone-700 mb-3">AIからの論点提示</h4>
+        <ul className="space-y-2">
+          {(term.pitch || []).map((p, i) => (
+            <li key={i} className="flex gap-3 p-3 bg-amber-50 border border-amber-200 rounded">
+              <span className="text-amber-700 font-medium">論点{i + 1}</span>
+              <span className="text-stone-800 serif">{p}</span>
+            </li>
+          ))}
+        </ul>
+        <RegenerateButtons onRegenerate={(m) => onRegenerate("valuePitch", m)} busy={busy} />
+      </div>
+      <div>
+        <h4 className="text-sm font-medium text-stone-700 mb-2">あなたのブランディング訴求メモ</h4>
+        <textarea value={term.myMemo || ""} onChange={(e) => onMemoChange(e.target.value)}
+          placeholder="論点を踏まえて、自分の言葉で訴求の方向性を書く。"
+          className="w-full h-40 p-3 border border-stone-300 rounded text-stone-900 text-sm focus:outline-none focus:border-stone-500 bg-white serif" />
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// 各画面
+// ============================================================
+
+function PortfolioView({ terms, onSelect, onAddNew, onSeed }) {
+  const [search, setSearch] = useState("");
+  const [activeTags, setActiveTags] = useState([]);
+
+  const allTags = useMemo(() => {
+    const set = new Set();
+    terms.forEach(t => (t.tags || []).forEach(tag => set.add(tag)));
+    return [...set].sort();
+  }, [terms]);
+
+  const filtered = useMemo(() => {
+    return terms.filter(t => {
+      if (search.trim()) {
+        const q = search.toLowerCase();
+        const hay = `${t.name} ${t.reading} ${t.category} ${(t.tags || []).join(" ")}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      if (activeTags.length > 0) {
+        const ts = t.tags || [];
+        if (!activeTags.some(tag => ts.includes(tag))) return false;
+      }
+      return true;
+    });
+  }, [terms, search, activeTags]);
+
+  return (
+    <div>
+      <div className="flex justify-between items-baseline mb-6">
+        <div>
+          <h2 className="text-3xl text-stone-900 mb-1 serif">竹中工務店 環境技術ポートフォリオ</h2>
+          <p className="text-sm text-stone-500">{terms.length} 件 · 5社軸（竹中・大林・鹿島・清水・大成）で比較</p>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={onSeed} className="px-4 py-2 bg-white text-stone-700 border border-stone-300 rounded text-sm hover:bg-stone-50">推奨セットを投入</button>
+          <button onClick={onAddNew} className="px-4 py-2 bg-stone-900 text-white rounded text-sm hover:bg-stone-800">+ 用語を追加</button>
+        </div>
+      </div>
+      <div className="mb-6 space-y-3">
+        <input value={search} onChange={e => setSearch(e.target.value)}
+          placeholder="検索（用語名・読み・カテゴリ・タグ）"
+          className="w-full px-3 py-2 text-sm border border-stone-300 rounded focus:outline-none focus:border-stone-500 bg-white" />
+        {allTags.length > 0 && (
+          <div>
+            <div className="text-xs text-stone-500 mb-1">タグで絞り込み</div>
+            <div className="flex flex-wrap gap-1">
+              {allTags.map(tag => (
+                <button key={tag} onClick={() => setActiveTags(prev => prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag])}
+                  className={`px-2 py-0.5 text-xs rounded-full border ${activeTags.includes(tag) ? "bg-stone-900 text-white border-stone-900" : "bg-stone-100 text-stone-700 border-stone-300 hover:bg-stone-200"}`}>
+                  #{tag}
+                </button>
+              ))}
+              {activeTags.length > 0 && <button onClick={() => setActiveTags([])} className="px-2 py-0.5 text-xs text-stone-500 hover:text-stone-900">クリア</button>}
+            </div>
+          </div>
+        )}
+      </div>
+      {filtered.length === 0 ? (
+        <div className="text-center py-16 text-stone-500">
+          {terms.length === 0 ? "まだ用語がありません。「推奨セットを投入」または「+ 用語を追加」から始めてください。" : "条件に合う用語がありません。"}
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {filtered.map(t => (
+            <button key={t.id} onClick={() => onSelect(t.id)} className="text-left p-5 bg-white border border-stone-200 rounded hover:border-stone-400 transition-colors">
+              <div className="mb-2"><CategoryBadge category={t.category} /></div>
+              <h3 className="text-lg text-stone-900 mb-1 serif">{t.name}</h3>
+              <p className="text-xs text-stone-500 mb-3">{t.reading}</p>
+              {t.value && (
+                <p className="text-sm text-stone-700 leading-relaxed line-clamp-2 mb-3">
+                  <span className="text-emerald-700 font-medium">差別化軸：</span>{t.value.differentiator}
+                </p>
+              )}
+              {t.tags && t.tags.length > 0 && (
+                <div className="flex flex-wrap gap-1 mt-2">
+                  {t.tags.slice(0, 3).map(tag => <TagChip key={tag} tag={tag} />)}
+                  {t.tags.length > 3 && <span className="text-xs text-stone-500">+{t.tags.length - 3}</span>}
+                </div>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DetailView({ term, allTags, useWebSearch, onBack, onUpdate, onDelete }) {
+  const [activeTab, setActiveTab] = useState(1);
+  const [busy, setBusy] = useState(false);
+  const tabs = [{ num: 1, label: "知る" }, { num: 2, label: "比べる" }, { num: 3, label: "価値を見る" }, { num: 4, label: "未来を見る" }, { num: 5, label: "訴求する" }];
+
+  async function handleRegenerate(section, modifier) {
+    setBusy(true);
+    try {
+      const result = await regenerateSection(term.name, section, modifier, useWebSearch);
+      if (result.error) { alert("生成失敗: " + result.error); return; }
+      const r = result.data;
+      const updated = { ...term };
+      if (section === "text") updated.know = { ...updated.know, definition: r.definition, analogy: r.analogy };
+      else if (section === "diagram") updated.know = { ...updated.know, diagramSVG: r.diagramSVG };
+      else if (section === "compare") updated.compare = r.compare || [];
+      else if (section === "valuePitch") { updated.value = r.value; updated.pitch = r.pitch || []; }
+      else if (section === "future") updated.future = r.future || [];
+      onUpdate(updated);
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <div>
+      <div className="flex justify-between items-center mb-6">
+        <button onClick={onBack} className="text-sm text-stone-600 hover:text-stone-900">← ポートフォリオ俯瞰に戻る</button>
+        <button onClick={() => { if (confirm(`「${term.name}」を削除しますか？`)) onDelete(term.id); }}
+          className="text-sm text-red-700 hover:text-red-900">削除</button>
+      </div>
+      <div className="mb-6">
+        <CategoryBadge category={term.category} />
+        <h2 className="text-4xl text-stone-900 mt-2 mb-1 serif">{term.name}</h2>
+        <p className="text-sm text-stone-500 mb-4">{term.reading}</p>
+        <div className="max-w-2xl">
+          <TagInput tags={term.tags || []} onChange={(tags) => onUpdate({ ...term, tags })} allTags={allTags} />
+        </div>
+      </div>
+      <div className="flex gap-1 mb-6 border-b border-stone-300">
+        {tabs.map(t => (
+          <button key={t.num} onClick={() => setActiveTab(t.num)}
+            className={`px-4 py-3 text-sm border-b-2 -mb-px ${activeTab === t.num ? "border-stone-900 text-stone-900 font-medium" : "border-transparent text-stone-500 hover:text-stone-800"}`}>
+            <span className="text-xs text-stone-400 mr-2">{`0${t.num}`}</span>{t.label}
+          </button>
+        ))}
+      </div>
+      <div className="bg-white p-6 border border-stone-200 rounded">
+        {activeTab === 1 && <Tab1Know term={term} onRegenerate={handleRegenerate} busy={busy} />}
+        {activeTab === 2 && <Tab2Compare term={term} onRegenerate={handleRegenerate} busy={busy} />}
+        {activeTab === 3 && <Tab3Value term={term} onRegenerate={handleRegenerate} busy={busy} />}
+        {activeTab === 4 && <Tab4Future term={term} onRegenerate={handleRegenerate} busy={busy} />}
+        {activeTab === 5 && <Tab5Pitch term={term} onMemoChange={(memo) => onUpdate({ ...term, myMemo: memo })} onRegenerate={handleRegenerate} busy={busy} />}
+      </div>
+    </div>
+  );
+}
+
+function AddView({ onCancel, onAdded, useWebSearch, setUseWebSearch }) {
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [log, setLog] = useState([]);
+
+  function addLog(text, error = false) {
+    const time = new Date().toLocaleTimeString("ja-JP");
+    setLog(prev => [...prev, { time, text, error }]);
+  }
+
+  async function handleGenerate() {
+    if (!name.trim()) return;
+    setBusy(true); setLog([]);
+    addLog(`「${name}」を生成開始（Web検索: ${useWebSearch ? "ON" : "OFF"}）`);
+    try {
+      const result = await generateFullTerm(name.trim(), useWebSearch, (p) => {
+        addLog(`${p.section}: ${p.status}${p.error ? ` (${p.error})` : ""}`, p.status === "error");
+      });
+      if (result.error) { addLog(result.error, true); return; }
+      addLog("完了！");
+      setTimeout(() => onAdded(result.term), 500);
+    } catch (e) { addLog("例外: " + e.message, true); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div>
+      <button onClick={onCancel} className="mb-6 text-sm text-stone-600 hover:text-stone-900">← 戻る</button>
+      <h2 className="text-3xl text-stone-900 mb-2 serif">新規用語を追加</h2>
+      <p className="text-sm text-stone-500 mb-8">技術名を入力すると、AIが5タブを逐次でリサーチして仕込みます。</p>
+      <div className="bg-white p-6 border border-stone-200 rounded">
+        <label className="block text-sm text-stone-700 mb-2">技術名</label>
+        <input type="text" value={name} onChange={(e) => setName(e.target.value)}
+          placeholder="例：燃エンウッド、バイオスキン …"
+          className="w-full p-3 border border-stone-300 rounded text-stone-900 focus:outline-none focus:border-stone-500 serif" disabled={busy} />
+        <div className="mt-3"><WebSearchToggle value={useWebSearch} onChange={setUseWebSearch} /></div>
+        <div className="mt-4 flex gap-2 items-center">
+          <button onClick={handleGenerate} disabled={busy || !name.trim()}
+            className="px-5 py-2 bg-stone-900 text-white rounded text-sm hover:bg-stone-800 disabled:opacity-40">
+            {busy ? "生成中…" : "AIで調べる"}
+          </button>
+        </div>
+        <ProgressLog log={log} />
+      </div>
+    </div>
+  );
+}
+
+function SeedView({ onCancel, onTermAdded, useWebSearch, setUseWebSearch }) {
+  const [list, setList] = useState(SEED_CANDIDATES_DEFAULT.join("\n"));
+  const [busy, setBusy] = useState(false);
+  const [log, setLog] = useState([]);
+  const [doneCount, setDoneCount] = useState(0);
+  const [totalCount, setTotalCount] = useState(0);
+
+  function addLog(text, error = false) {
+    const time = new Date().toLocaleTimeString("ja-JP");
+    setLog(prev => [...prev, { time, text, error }]);
+  }
+
+  async function handleSeed() {
+    const names = list.split("\n").map(s => s.trim()).filter(Boolean);
+    if (names.length === 0) return;
+    setBusy(true); setLog([]); setDoneCount(0); setTotalCount(names.length);
+    addLog(`${names.length}件の処理開始（Web検索: ${useWebSearch ? "ON" : "OFF"}）`);
+
+    for (let i = 0; i < names.length; i++) {
+      const n = names[i];
+      addLog(`[${i + 1}/${names.length}] ${n} 開始`);
+      try {
+        const result = await generateFullTerm(n, useWebSearch, (p) => {
+          if (p.status === "error") addLog(`  └ ${p.section}: ${p.error}`, true);
+        });
+        if (result.error) {
+          addLog(`  └ 失敗: ${result.error}`, true);
+        } else {
+          onTermAdded(result.term);
+          addLog(`  └ ${n} 完了 ✓`);
+        }
+      } catch (e) {
+        addLog(`  └ 例外: ${e.message}`, true);
+      }
+      setDoneCount(i + 1);
+    }
+    addLog("全処理完了");
+    setBusy(false);
+  }
+
+  return (
+    <div>
+      <button onClick={onCancel} disabled={busy} className="mb-6 text-sm text-stone-600 hover:text-stone-900 disabled:opacity-40">← 戻る</button>
+      <h2 className="text-3xl text-stone-900 mb-2 serif">推奨セットを投入</h2>
+      <p className="text-sm text-stone-500 mb-6">候補リストを編集してから一括リサーチ。1件ずつ完了次第ポートフォリオに追加されlocalStorageに保存されます。</p>
+      <div className="bg-white p-6 border border-stone-200 rounded">
+        <label className="block text-sm text-stone-700 mb-2">技術名（1行に1つ）</label>
+        <textarea value={list} onChange={e => setList(e.target.value)} disabled={busy}
+          className="w-full h-48 p-3 border border-stone-300 rounded text-stone-900 text-sm focus:outline-none focus:border-stone-500 bg-white font-mono" />
+        <div className="mt-3"><WebSearchToggle value={useWebSearch} onChange={setUseWebSearch} /></div>
+        <div className="mt-4 flex gap-2 items-center">
+          <button onClick={handleSeed} disabled={busy || !list.trim()}
+            className="px-5 py-2 bg-stone-900 text-white rounded text-sm hover:bg-stone-800 disabled:opacity-40">
+            {busy ? `処理中（${doneCount}/${totalCount}）…` : "リサーチ開始"}
+          </button>
+          {!busy && <span className="text-xs text-stone-500">Web検索OFFなら1件 25〜50秒</span>}
+        </div>
+        <ProgressLog log={log} />
+      </div>
+    </div>
+  );
+}
+
+function SettingsModal({ onClose }) {
+  const [key, setKey] = useState(getApiKey());
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState(null);
+
+  async function testConnection() {
+    setApiKeyLS(key);
+    setTesting(true); setTestResult(null);
+    const r = await callClaudeForJSON({
+      userPrompt: "「OK」とだけJSONで返してください。形式: {\"message\":\"OK\"}",
+      systemPrompt: "JSONのみ返す。",
+      useWebSearch: false,
+    });
+    setTestResult(r);
+    setTesting(false);
+  }
+
+  function save() { setApiKeyLS(key); onClose(); }
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center z-50">
+      <div className="bg-white rounded-lg p-6 max-w-lg w-full mx-4">
+        <h3 className="text-xl text-stone-900 mb-4 serif">設定</h3>
+        <div className="mb-4">
+          <label className="block text-sm text-stone-700 mb-2">Anthropic API キー</label>
+          <input type="password" value={key} onChange={e => setKey(e.target.value)}
+            placeholder="sk-ant-api03-..."
+            className="w-full p-2 border border-stone-300 rounded text-sm font-mono" />
+          <p className="text-xs text-stone-500 mt-1">
+            <a href="https://console.anthropic.com/settings/keys" target="_blank" className="underline hover:text-stone-700">console.anthropic.com</a> で取得。このブラウザのlocalStorageにのみ保存。
+          </p>
+        </div>
+        <div className="flex gap-2 mb-4">
+          <button onClick={testConnection} disabled={testing || !key}
+            className="px-3 py-1.5 text-sm bg-stone-100 text-stone-700 border border-stone-300 rounded hover:bg-stone-200 disabled:opacity-40">
+            {testing ? "接続テスト中…" : "🔧 接続テスト"}
+          </button>
+          {testResult && (
+            <span className={`text-xs self-center ${testResult.error ? "text-red-700" : "text-emerald-700"}`}>
+              {testResult.error ? `❌ ${testResult.error}` : `✓ 接続OK`}
+            </span>
+          )}
+        </div>
+        <div className="flex justify-end gap-2 pt-4 border-t border-stone-200">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-stone-700 hover:bg-stone-100 rounded">キャンセル</button>
+          <button onClick={save} className="px-4 py-2 text-sm bg-stone-900 text-white rounded hover:bg-stone-800">保存</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// エクスポート / インポート
+// ============================================================
+
+function exportJSON(terms) {
+  const blob = new Blob([JSON.stringify(terms, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `brand-intel-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ============================================================
+// メインApp
+// ============================================================
+
+function App() {
+  const [view, setView] = useState("portfolio");
+  const [terms, setTerms] = useState(loadTerms);
+  const [selectedId, setSelectedId] = useState(null);
+  const [useWebSearch, setUseWebSearch] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const fileInputRef = useRef(null);
+
+  // 初回起動でAPIキー未設定なら設定モーダルを開く
+  useEffect(() => {
+    if (!getApiKey()) setShowSettings(true);
+  }, []);
+
+  const selectedTerm = terms.find(t => t.id === selectedId);
+
+  const allTags = useMemo(() => {
+    const set = new Set();
+    terms.forEach(t => (t.tags || []).forEach(tag => set.add(tag)));
+    return [...set].sort();
+  }, [terms]);
+
+  function updateTerms(updater) {
+    setTerms(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      saveAllTerms(next);
+      return next;
+    });
+  }
+
+  function handleAdd(term) {
+    updateTerms(prev => [...prev, term]);
+    setSelectedId(term.id);
+    setView("detail");
+  }
+
+  function handleTermAdded(term) {
+    updateTerms(prev => [...prev, term]);
+  }
+
+  function handleUpdate(updated) {
+    updateTerms(prev => prev.map(t => (t.id === updated.id ? updated : t)));
+  }
+
+  function handleDelete(termId) {
+    updateTerms(prev => prev.filter(t => t.id !== termId));
+    setSelectedId(null);
+    setView("portfolio");
+  }
+
+  function handleImport(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        if (!Array.isArray(data)) { alert("JSONの形式が違います（配列が必要）"); return; }
+        if (confirm(`${data.length}件の用語をインポートします。現在の${terms.length}件と統合します（同じIDは上書き）。よろしいですか？`)) {
+          updateTerms(prev => {
+            const map = new Map(prev.map(t => [t.id, t]));
+            data.forEach(t => map.set(t.id, t));
+            return [...map.values()];
+          });
+          alert("インポート完了");
+        }
+      } catch (err) { alert("ファイル読み込み失敗: " + err.message); }
+    };
+    reader.readAsText(file);
+    e.target.value = ""; // reset
+  }
+
+  return (
+    <div className="min-h-screen bg-stone-50 text-stone-900">
+      <header className="border-b border-stone-300 bg-white">
+        <div className="max-w-6xl mx-auto px-6 py-4 flex justify-between items-baseline">
+          <div>
+            <div className="text-xs tracking-widest text-stone-500 uppercase">PwC × Takenaka</div>
+            <h1 className="text-xl text-stone-900 serif">環境技術ブランディング・インテリジェンス</h1>
+          </div>
+          <div className="flex items-center gap-3 text-xs">
+            <button onClick={() => exportJSON(terms)} className="text-stone-600 hover:text-stone-900 underline">エクスポート</button>
+            <button onClick={() => fileInputRef.current?.click()} className="text-stone-600 hover:text-stone-900 underline">インポート</button>
+            <input type="file" accept="application/json" ref={fileInputRef} onChange={handleImport} className="hidden" />
+            <button onClick={() => setShowSettings(true)} className="text-stone-600 hover:text-stone-900 underline">設定</button>
+          </div>
+        </div>
+      </header>
+      <main className="max-w-6xl mx-auto px-6 py-10">
+        {view === "portfolio" && (
+          <PortfolioView terms={terms}
+            onSelect={(id) => { setSelectedId(id); setView("detail"); }}
+            onAddNew={() => setView("add")}
+            onSeed={() => setView("seed")} />
+        )}
+        {view === "detail" && selectedTerm && (
+          <DetailView term={selectedTerm} allTags={allTags} useWebSearch={useWebSearch}
+            onBack={() => setView("portfolio")} onUpdate={handleUpdate} onDelete={handleDelete} />
+        )}
+        {view === "add" && (
+          <AddView onCancel={() => setView("portfolio")} onAdded={handleAdd}
+            useWebSearch={useWebSearch} setUseWebSearch={setUseWebSearch} />
+        )}
+        {view === "seed" && (
+          <SeedView onCancel={() => setView("portfolio")} onTermAdded={handleTermAdded}
+            useWebSearch={useWebSearch} setUseWebSearch={setUseWebSearch} />
+        )}
+      </main>
+      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+  </script>
+</body>
+</html>
