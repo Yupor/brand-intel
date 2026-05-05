@@ -369,7 +369,7 @@ SVG厳守ルール:
 ==========================================
 - basisが"fact"の場合は嘘を書かない。確信が持てない場合は basis を "hypothesis" にする
 - sourcesには信頼できる実在URLのみ。ない場合は空配列 []
-- modifier指示（「もっとブランディング担当者向けに」「もっと簡単に」など）が user 側にある場合は反映する
+- modifier指示（「もっとブランディング担当者向けに」「もっと簡単に」など）が user 側にある場合は、JSONの**構造（スキーマ）は絶対に変えず**、各テキストフィールドの**表現だけ**を変える。フィールドを増やしたり減らしたり、配列を空にしたりしない
 - 全てのテキストは日本語
 
 ==========================================
@@ -668,7 +668,14 @@ function MasteryStars({ value, onChange, size = "md" }) {
 
 function Tab2Compare({ term, onRegenerate, busy }) {
   const [view, setView] = useState("table");
-  if (!term.compare || term.compare.length === 0) return <div className="text-stone-500">データなし</div>;
+  if (!term.compare || term.compare.length === 0) {
+    return (
+      <div>
+        <div className="text-stone-500 mb-3">データなし — 再生成してください</div>
+        <RegenerateButtons onRegenerate={(m) => onRegenerate("compare", m)} busy={busy} />
+      </div>
+    );
+  }
 
   // 竹中の行を生成（valueタブから流用 + know情報）
   const takenakaRow = {
@@ -776,7 +783,14 @@ function Tab2Compare({ term, onRegenerate, busy }) {
 
 function Tab3Value({ term, onRegenerate, busy }) {
   const v = term.value;
-  if (!v) return <div className="text-stone-500">データなし</div>;
+  if (!v) {
+    return (
+      <div>
+        <div className="text-stone-500 mb-3">データなし — 再生成してください</div>
+        <RegenerateButtons onRegenerate={(m) => onRegenerate("valuePitch", m)} busy={busy} />
+      </div>
+    );
+  }
   return (
     <div>
       <div className="mb-6 p-5 bg-emerald-50 border border-emerald-200 rounded">
@@ -795,7 +809,14 @@ function Tab3Value({ term, onRegenerate, busy }) {
 }
 
 function Tab4Future({ term, onRegenerate, busy }) {
-  if (!term.future || term.future.length === 0) return <div className="text-stone-500">データなし</div>;
+  if (!term.future || term.future.length === 0) {
+    return (
+      <div>
+        <div className="text-stone-500 mb-3">データなし — 再生成してください</div>
+        <RegenerateButtons onRegenerate={(m) => onRegenerate("future", m)} busy={busy} />
+      </div>
+    );
+  }
   return (
     <div>
       <div className="space-y-4">
@@ -1025,7 +1046,18 @@ function PortfolioView({ terms, onSelect, onAddNew, onSeed, onUpdateOrder, onDel
 function DetailView({ term, allTags, useWebSearch, onBack, onUpdate, onDelete }) {
   const [activeTab, setActiveTab] = useState(1);
   const [busy, setBusy] = useState(false);
+  const [history, setHistory] = useState([]); // 再生成前の状態を積むスタック
   const tabs = [{ num: 1, label: "知る" }, { num: 2, label: "比べる" }, { num: 3, label: "価値を見る" }, { num: 4, label: "未来を見る" }, { num: 5, label: "訴求する" }];
+
+  // 別の用語に移動したら履歴をクリア
+  useEffect(() => { setHistory([]); }, [term.id]);
+
+  function handleUndo() {
+    if (history.length === 0) return;
+    const previous = history[history.length - 1];
+    setHistory(prev => prev.slice(0, -1));
+    onUpdate(previous);
+  }
 
   async function handleRegenerate(section, modifier) {
     setBusy(true);
@@ -1033,12 +1065,45 @@ function DetailView({ term, allTags, useWebSearch, onBack, onUpdate, onDelete })
       const result = await regenerateSection(term.name, section, modifier, useWebSearch);
       if (result.error) { alert("生成失敗: " + result.error); return; }
       const r = result.data;
+      if (r.error === "unknown_technology") {
+        alert(`AIが技術名を認識できませんでした。\n\n候補: ${r.suggestion || "（提案なし）"}\n\n元のデータは保持します。`);
+        return;
+      }
       const updated = { ...term };
-      if (section === "text") updated.know = { ...updated.know, definition: r.definition, analogy: r.analogy };
-      else if (section === "diagram") updated.know = { ...updated.know, diagramSVG: r.diagramSVG };
-      else if (section === "compare") updated.compare = r.compare || [];
-      else if (section === "valuePitch") { updated.value = r.value; updated.pitch = r.pitch || []; }
-      else if (section === "future") updated.future = r.future || [];
+      let valid = false;
+      if (section === "text") {
+        if (r.definition && r.analogy) {
+          updated.know = { ...updated.know, definition: r.definition, analogy: r.analogy };
+          valid = true;
+        }
+      } else if (section === "diagram") {
+        if (r.diagramSVG && typeof r.diagramSVG === "string" && r.diagramSVG.includes("<svg")) {
+          updated.know = { ...updated.know, diagramSVG: r.diagramSVG };
+          valid = true;
+        }
+      } else if (section === "compare") {
+        if (Array.isArray(r.compare) && r.compare.length > 0) {
+          updated.compare = r.compare;
+          valid = true;
+        }
+      } else if (section === "valuePitch") {
+        if (r.value && Array.isArray(r.pitch)) {
+          updated.value = r.value;
+          updated.pitch = r.pitch;
+          valid = true;
+        }
+      } else if (section === "future") {
+        if (Array.isArray(r.future) && r.future.length > 0) {
+          updated.future = r.future;
+          valid = true;
+        }
+      }
+      if (!valid) {
+        alert("再生成の結果が想定外の形式でした。元のデータを保持します。\nもう一度お試しください。");
+        return;
+      }
+      // 成功時のみ履歴に積む
+      setHistory(prev => [...prev, { ...term }]);
       onUpdate(updated);
     } finally { setBusy(false); }
   }
@@ -1047,8 +1112,17 @@ function DetailView({ term, allTags, useWebSearch, onBack, onUpdate, onDelete })
     <div>
       <div className="flex justify-between items-center mb-6">
         <button onClick={onBack} className="text-sm text-stone-600 hover:text-stone-900">← ポートフォリオ俯瞰に戻る</button>
-        <button onClick={() => { if (confirm(`「${term.name}」を削除しますか？`)) onDelete(term.id); }}
-          className="text-sm text-red-700 hover:text-red-900">削除</button>
+        <div className="flex gap-4 items-center">
+          {history.length > 0 && (
+            <button onClick={handleUndo}
+              className="text-sm text-stone-700 hover:text-stone-900 underline"
+              title={`${history.length}回戻れます`}>
+              ↩️ 元に戻す{history.length > 1 ? ` (${history.length})` : ""}
+            </button>
+          )}
+          <button onClick={() => { if (confirm(`「${term.name}」を削除しますか？`)) onDelete(term.id); }}
+            className="text-sm text-red-700 hover:text-red-900">削除</button>
+        </div>
       </div>
       <div className="mb-6">
         <CategoryBadge category={term.category} />
