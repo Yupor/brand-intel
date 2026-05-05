@@ -42,7 +42,7 @@ const SEED_CANDIDATES_DEFAULT = [
   "バイオスキン",
   "T-Light blade",
   "アクアフェロー",
-  "エコクリート",
+  "ECMコンクリート",
   "T-Wave",
   "CO2-SUICOM",
   "屋上緑化システム",
@@ -84,8 +84,8 @@ class RateLimiter {
   }
 }
 
-// Tier 1: ITPM 30,000 → 安全マージン85%で運用
-const inputLimiter = new RateLimiter(25000, 60000);
+// Tier 2: ITPM 40,000 → 安全マージン85%で運用
+const inputLimiter = new RateLimiter(34000, 60000);
 
 let onRateLimitWait = null; // UIにログ出すためのフック
 
@@ -288,10 +288,22 @@ SVG厳守ルール:
 セクション: compare
 ==========================================
 スーパーゼネコン4社（大林組・鹿島建設・清水建設・大成建設）の対応技術を比較。
+学習用なので、各社について以下6項目を埋める。
 
 {
   "compare": [
-    { "company": "大林組", "tech": "対応技術名（無ければ「該当なし」）", "summary": "60字以内の特徴", "diff": "竹中との差分（60字以内）", "basis": "fact|hypothesis", "sources": [] },
+    {
+      "company": "大林組",
+      "tech": "対応技術名（無ければ「該当なし」）",
+      "yearTrademark": "開発年や商標登録の有無（例：2018年、商標登録®あり）",
+      "coreMechanism": "仕組みの核心を40字以内で",
+      "performance": "数値性能（例：CO2削減率30%、強度50N/mm²等。不明なら「公表データなし」）",
+      "applications": "適用実績（建物名・件数など。不明なら「公表データなし」）",
+      "diff": "竹中との差分・差別化ポイント（60字以内）",
+      "summary": "総合特徴（60字以内、カードビュー表示用）",
+      "basis": "fact|hypothesis",
+      "sources": []
+    },
     { "company": "鹿島建設", ... },
     { "company": "清水建設", ... },
     { "company": "大成建設", ... }
@@ -358,7 +370,20 @@ SVG厳守ルール:
 - basisが"fact"の場合は嘘を書かない。確信が持てない場合は basis を "hypothesis" にする
 - sourcesには信頼できる実在URLのみ。ない場合は空配列 []
 - modifier指示（「もっとブランディング担当者向けに」「もっと簡単に」など）が user 側にある場合は反映する
-- 全てのテキストは日本語`;
+- 全てのテキストは日本語
+
+==========================================
+重要：技術名が誤っているまたは確認できない場合
+==========================================
+入力された技術名が竹中工務店の正式技術名でない、または存在を確認できない場合でも、
+必ずJSONを返す。前置き・解説文を返してはいけない。以下のいずれかで対応：
+
+(1) 似た正式技術名が分かる場合：その正式名称で nameフィールドを置き換えて、
+    通常通り該当セクションのデータを返す。definition.text の冒頭で「正式名称は○○です」と注記。
+    例：入力「エコクリート」→ name: "ECMコンクリート®", definition.text: "正式名称はECMコンクリート®。..."
+
+(2) どうしても該当が分からない場合：以下のJSONで返す（セクション問わず共通）
+    { "error": "unknown_technology", "input": "入力された名前", "suggestion": "近そうな正式名称があれば1つだけ" }`;
 
 function normalizeTermName(name) {
   return (name || "").toLowerCase().replace(/[\s®™©・\-\u30fb（）()]/g, "").trim();
@@ -396,7 +421,7 @@ async function generateFullTerm(termName, useWebSearch, onProgress) {
   const sections = [
     { key: "text", section: "text", label: "①知る（テキスト）", maxTokens: 800 },
     { key: "diagram", section: "diagram", label: "①知る（図解）", maxTokens: 2500 },
-    { key: "compare", section: "compare", label: "②比べる", maxTokens: 1500 },
+    { key: "compare", section: "compare", label: "②比べる", maxTokens: 2500 },
     { key: "valuePitch", section: "valuePitch", label: "③価値・⑤訴求", maxTokens: 800 },
     { key: "future", section: "future", label: "④未来", maxTokens: 1800 },
   ];
@@ -428,6 +453,7 @@ async function generateFullTerm(termName, useWebSearch, onProgress) {
       reading: text.reading || "",
       category: text.category || "その他",
       tags: [],
+      mastery: 0,
       know: { definition: text.definition, analogy: text.analogy, diagramSVG: diagram?.diagramSVG || "" },
       compare: compare?.compare || [],
       value: valuePitch?.value || null,
@@ -449,7 +475,7 @@ const MODIFIER_PROMPTS = {
 
 async function regenerateSection(termName, section, modifier, useWebSearch) {
   const userVars = `技術名: ${termName}\n指示: ${MODIFIER_PROMPTS[modifier]}`;
-  const tokensMap = { text: 800, diagram: 2500, compare: 1500, valuePitch: 800, future: 1800 };
+  const tokensMap = { text: 800, diagram: 2500, compare: 2500, valuePitch: 800, future: 1800 };
   return await callClaudeForJSON({ section, userVars, useWebSearch, maxTokens: tokensMap[section] });
 }
 
@@ -541,9 +567,15 @@ function RegenerateButtons({ onRegenerate, busy }) {
 
 function WebSearchToggle({ value, onChange }) {
   return (
-    <label className="flex items-center gap-2 text-sm text-stone-700 cursor-pointer">
-      <input type="checkbox" checked={value} onChange={e => onChange(e.target.checked)} className="rounded" />
-      <span>Web検索で裏取り（精度↑、時間 1件あたり +30〜60秒）</span>
+    <label className="flex items-start gap-2 text-sm text-stone-700 cursor-pointer">
+      <input type="checkbox" checked={value} onChange={e => onChange(e.target.checked)} className="rounded mt-1" />
+      <span>
+        <span className="font-medium">Web検索で裏取り</span>
+        <span className="block text-xs text-amber-700 mt-0.5">
+          ⚠️ 入力トークン使用量が10〜100倍になります（検索結果の中身が全部入力に乗るため）。
+          推奨セット投入時は OFF が安全。個別の用語で深堀りしたい時のみ ON 推奨。
+        </span>
+      </span>
     </label>
   );
 }
@@ -606,27 +638,137 @@ function Tab1Know({ term, onRegenerate, busy }) {
   );
 }
 
-function Tab2Compare({ term, onRegenerate, busy }) {
-  if (!term.compare || term.compare.length === 0) return <div className="text-stone-500">データなし</div>;
+function MasteryStars({ value, onChange, size = "md" }) {
+  const meanings = [
+    "未学習",
+    "単語を見たことがある",
+    "意味は分かる",
+    "人に説明できる",
+    "応用議論できる",
+    "専門家として答えられる",
+  ];
+  const cls = size === "sm" ? "text-sm" : "text-xl";
   return (
-    <div>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        {term.compare.map((c, i) => (
-          <div key={i} className="border border-stone-200 rounded p-4 bg-white">
-            <div className="flex justify-between items-start mb-2">
-              <h4 className="font-medium text-stone-900">{c.company}</h4>
-              <BasisBadge basis={c.basis} sources={c.sources} />
-            </div>
-            <div className="text-xs text-stone-500 mb-1">対応技術</div>
-            <div className="text-sm text-stone-800 mb-3">{c.tech}</div>
-            <div className="text-xs text-stone-500 mb-1">特徴</div>
-            <div className="text-sm text-stone-700 mb-3">{c.summary}</div>
-            <div className="text-xs text-stone-500 mb-1">竹中との差分</div>
-            <div className="text-sm text-stone-700 italic">{c.diff}</div>
-            <SourceLinks sources={c.sources} />
-          </div>
+    <div className="inline-flex items-center gap-2">
+      <div className={`flex gap-0.5 ${cls}`}>
+        {[1, 2, 3, 4, 5].map(n => (
+          <button key={n} onClick={() => onChange(value === n ? 0 : n)}
+            className={`${value >= n ? "text-amber-500" : "text-stone-300"} hover:scale-110 transition-transform leading-none`}
+            title={meanings[n]}>
+            {value >= n ? "★" : "☆"}
+          </button>
         ))}
       </div>
+      {size !== "sm" && (
+        <span className="text-xs text-stone-500">{meanings[value || 0]}</span>
+      )}
+    </div>
+  );
+}
+
+function Tab2Compare({ term, onRegenerate, busy }) {
+  const [view, setView] = useState("table");
+  if (!term.compare || term.compare.length === 0) return <div className="text-stone-500">データなし</div>;
+
+  // 竹中の行を生成（valueタブから流用 + know情報）
+  const takenakaRow = {
+    company: "竹中工務店",
+    tech: term.name,
+    yearTrademark: term.know?.definition?.text ? "" : "",
+    coreMechanism: term.know?.definition?.text?.slice(0, 40) || "",
+    performance: "",
+    applications: "",
+    diff: "（自社）",
+    summary: term.value?.differentiator || "",
+    basis: term.value?.basis || "hypothesis",
+    sources: term.value?.sources || [],
+  };
+  const allRows = [takenakaRow, ...term.compare];
+
+  const fields = [
+    { key: "tech", label: "対応技術名", width: "w-40" },
+    { key: "yearTrademark", label: "開発年・商標", width: "w-36" },
+    { key: "coreMechanism", label: "仕組みの核心", width: "w-56" },
+    { key: "performance", label: "数値性能", width: "w-48" },
+    { key: "applications", label: "適用実績", width: "w-48" },
+    { key: "diff", label: "竹中との差分", width: "w-56" },
+  ];
+
+  return (
+    <div>
+      <div className="flex gap-1 mb-4 border-b border-stone-200">
+        <button onClick={() => setView("table")}
+          className={`px-4 py-2 text-sm border-b-2 -mb-px ${view === "table" ? "border-stone-900 text-stone-900 font-medium" : "border-transparent text-stone-500 hover:text-stone-800"}`}>
+          📊 比較表ビュー
+        </button>
+        <button onClick={() => setView("cards")}
+          className={`px-4 py-2 text-sm border-b-2 -mb-px ${view === "cards" ? "border-stone-900 text-stone-900 font-medium" : "border-transparent text-stone-500 hover:text-stone-800"}`}>
+          📇 カードビュー
+        </button>
+      </div>
+
+      {view === "table" && (
+        <div>
+          <div className="overflow-x-auto border border-stone-200 rounded">
+            <table className="text-sm">
+              <thead className="bg-stone-50">
+                <tr>
+                  <th className="sticky left-0 bg-stone-50 border-r border-b border-stone-200 px-3 py-2 text-left font-medium text-stone-700 w-32">項目</th>
+                  {allRows.map((c, i) => (
+                    <th key={i} className={`border-b border-stone-200 px-3 py-2 text-left font-medium ${i === 0 ? "bg-emerald-50 text-emerald-900" : "text-stone-700"}`}>
+                      {c.company}
+                      {i > 0 && <BasisBadge basis={c.basis} sources={c.sources} />}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {fields.map(f => (
+                  <tr key={f.key} className="border-b border-stone-100 last:border-b-0">
+                    <td className="sticky left-0 bg-white border-r border-stone-200 px-3 py-3 text-xs text-stone-500 font-medium align-top">{f.label}</td>
+                    {allRows.map((c, i) => (
+                      <td key={i} className={`px-3 py-3 align-top ${f.width} ${i === 0 ? "bg-emerald-50/30" : ""}`}>
+                        <div className="text-stone-800 leading-relaxed">{c[f.key] || <span className="text-stone-400">—</span>}</div>
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-stone-500 mt-2">横スクロールで全社確認。データが「—」のセルは公表情報なしまたは未生成。</p>
+        </div>
+      )}
+
+      {view === "cards" && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {term.compare.map((c, i) => (
+            <div key={i} className="border border-stone-200 rounded p-4 bg-white">
+              <div className="flex justify-between items-start mb-2">
+                <h4 className="font-medium text-stone-900">{c.company}</h4>
+                <BasisBadge basis={c.basis} sources={c.sources} />
+              </div>
+              <div className="text-xs text-stone-500 mb-1">対応技術</div>
+              <div className="text-sm text-stone-800 mb-3">{c.tech}</div>
+              {c.coreMechanism && <>
+                <div className="text-xs text-stone-500 mb-1">仕組みの核心</div>
+                <div className="text-sm text-stone-700 mb-3">{c.coreMechanism}</div>
+              </>}
+              {c.performance && <>
+                <div className="text-xs text-stone-500 mb-1">数値性能</div>
+                <div className="text-sm text-stone-700 mb-3">{c.performance}</div>
+              </>}
+              {c.applications && <>
+                <div className="text-xs text-stone-500 mb-1">適用実績</div>
+                <div className="text-sm text-stone-700 mb-3">{c.applications}</div>
+              </>}
+              <div className="text-xs text-stone-500 mb-1">竹中との差分</div>
+              <div className="text-sm text-stone-700 italic">{c.diff}</div>
+              <SourceLinks sources={c.sources} />
+            </div>
+          ))}
+        </div>
+      )}
       <RegenerateButtons onRegenerate={(m) => onRegenerate("compare", m)} busy={busy} />
     </div>
   );
@@ -706,9 +848,12 @@ function Tab5Pitch({ term, onMemoChange, onRegenerate, busy }) {
 // 各画面
 // ============================================================
 
-function PortfolioView({ terms, onSelect, onAddNew, onSeed }) {
+function PortfolioView({ terms, onSelect, onAddNew, onSeed, onUpdateOrder, onDelete }) {
   const [search, setSearch] = useState("");
   const [activeTags, setActiveTags] = useState([]);
+  const [masteryFilter, setMasteryFilter] = useState("all");
+  const [draggedTermId, setDraggedTermId] = useState(null);
+  const [dragOverTermId, setDragOverTermId] = useState(null);
 
   const allTags = useMemo(() => {
     const set = new Set();
@@ -727,9 +872,46 @@ function PortfolioView({ terms, onSelect, onAddNew, onSeed }) {
         const ts = t.tags || [];
         if (!activeTags.some(tag => ts.includes(tag))) return false;
       }
+      const m = t.mastery || 0;
+      if (masteryFilter === "unstarted" && m !== 0) return false;
+      if (masteryFilter === "low" && (m < 1 || m > 2)) return false;
+      if (masteryFilter === "mid" && (m < 3 || m > 4)) return false;
+      if (masteryFilter === "high" && m !== 5) return false;
       return true;
     });
-  }, [terms, search, activeTags]);
+  }, [terms, search, activeTags, masteryFilter]);
+
+  function handleDragStart(e, termId) {
+    setDraggedTermId(termId);
+    e.dataTransfer.effectAllowed = "move";
+  }
+  function handleDragOver(e, termId) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    if (draggedTermId && draggedTermId !== termId) setDragOverTermId(termId);
+  }
+  function handleDragLeave() { setDragOverTermId(null); }
+  function handleDrop(e, targetTermId) {
+    e.preventDefault();
+    if (!draggedTermId || draggedTermId === targetTermId) {
+      setDraggedTermId(null); setDragOverTermId(null); return;
+    }
+    const draggedIdx = terms.findIndex(t => t.id === draggedTermId);
+    const targetIdx = terms.findIndex(t => t.id === targetTermId);
+    if (draggedIdx === -1 || targetIdx === -1) return;
+    const reordered = [...terms];
+    const [moved] = reordered.splice(draggedIdx, 1);
+    const insertIdx = targetIdx > draggedIdx ? targetIdx - 1 : targetIdx;
+    reordered.splice(insertIdx, 0, moved);
+    onUpdateOrder(reordered);
+    setDraggedTermId(null); setDragOverTermId(null);
+  }
+  function handleDragEnd() { setDraggedTermId(null); setDragOverTermId(null); }
+
+  function handleDeleteCard(e, term) {
+    e.stopPropagation();
+    if (confirm(`「${term.name}」を削除しますか？`)) onDelete(term.id);
+  }
 
   return (
     <div>
@@ -747,6 +929,23 @@ function PortfolioView({ terms, onSelect, onAddNew, onSeed }) {
         <input value={search} onChange={e => setSearch(e.target.value)}
           placeholder="検索（用語名・読み・カテゴリ・タグ）"
           className="w-full px-3 py-2 text-sm border border-stone-300 rounded focus:outline-none focus:border-stone-500 bg-white" />
+        <div>
+          <div className="text-xs text-stone-500 mb-1">習熟度で絞り込み</div>
+          <div className="flex flex-wrap gap-1">
+            {[
+              { key: "all", label: "すべて" },
+              { key: "unstarted", label: "☆ 未学習" },
+              { key: "low", label: "★〜★★ 入門" },
+              { key: "mid", label: "★★★〜★★★★ 説明可" },
+              { key: "high", label: "★★★★★ 達人" },
+            ].map(f => (
+              <button key={f.key} onClick={() => setMasteryFilter(f.key)}
+                className={`px-2 py-0.5 text-xs rounded-full border ${masteryFilter === f.key ? "bg-stone-900 text-white border-stone-900" : "bg-stone-100 text-stone-700 border-stone-300 hover:bg-stone-200"}`}>
+                {f.label}
+              </button>
+            ))}
+          </div>
+        </div>
         {allTags.length > 0 && (
           <div>
             <div className="text-xs text-stone-500 mb-1">タグで絞り込み</div>
@@ -768,24 +967,55 @@ function PortfolioView({ terms, onSelect, onAddNew, onSeed }) {
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filtered.map(t => (
-            <button key={t.id} onClick={() => onSelect(t.id)} className="text-left p-5 bg-white border border-stone-200 rounded hover:border-stone-400 transition-colors">
-              <div className="mb-2"><CategoryBadge category={t.category} /></div>
-              <h3 className="text-lg text-stone-900 mb-1 serif">{t.name}</h3>
-              <p className="text-xs text-stone-500 mb-3">{t.reading}</p>
-              {t.value && (
-                <p className="text-sm text-stone-700 leading-relaxed line-clamp-2 mb-3">
-                  <span className="text-emerald-700 font-medium">差別化軸：</span>{t.value.differentiator}
-                </p>
-              )}
-              {t.tags && t.tags.length > 0 && (
-                <div className="flex flex-wrap gap-1 mt-2">
-                  {t.tags.slice(0, 3).map(tag => <TagChip key={tag} tag={tag} />)}
-                  {t.tags.length > 3 && <span className="text-xs text-stone-500">+{t.tags.length - 3}</span>}
+          {filtered.map(t => {
+            const isDragging = draggedTermId === t.id;
+            const isDragOver = dragOverTermId === t.id;
+            return (
+              <div
+                key={t.id}
+                draggable
+                onDragStart={(e) => handleDragStart(e, t.id)}
+                onDragOver={(e) => handleDragOver(e, t.id)}
+                onDragLeave={handleDragLeave}
+                onDrop={(e) => handleDrop(e, t.id)}
+                onDragEnd={handleDragEnd}
+                onClick={() => onSelect(t.id)}
+                className={`group relative cursor-pointer text-left p-5 bg-white border rounded transition-all ${
+                  isDragging ? "opacity-30" : "hover:border-stone-400"
+                } ${isDragOver ? "border-stone-900 border-2" : "border-stone-200"}`}
+              >
+                <button
+                  onClick={(e) => handleDeleteCard(e, t)}
+                  title="削除"
+                  className="absolute -top-2 -right-2 z-10 w-7 h-7 flex items-center justify-center text-lg text-stone-500 bg-white border border-stone-300 rounded-full opacity-0 group-hover:opacity-100 hover:text-red-700 hover:border-red-400 transition-opacity shadow-sm"
+                >×</button>
+                <div className="absolute top-2 left-2 text-stone-300 opacity-0 group-hover:opacity-60 select-none text-sm pointer-events-none" aria-hidden>⋮⋮</div>
+                <div className="flex justify-between items-start mb-2 pl-5">
+                  <CategoryBadge category={t.category} />
+                  <div className="text-xs">
+                    {(t.mastery || 0) > 0 ? (
+                      <span className="text-amber-500">{"★".repeat(t.mastery)}<span className="text-stone-300">{"☆".repeat(5 - t.mastery)}</span></span>
+                    ) : (
+                      <span className="text-stone-300">☆☆☆☆☆</span>
+                    )}
+                  </div>
                 </div>
-              )}
-            </button>
-          ))}
+                <h3 className="text-lg text-stone-900 mb-1 serif">{t.name}</h3>
+                <p className="text-xs text-stone-500 mb-3">{t.reading}</p>
+                {t.value && (
+                  <p className="text-sm text-stone-700 leading-relaxed line-clamp-2 mb-3">
+                    <span className="text-emerald-700 font-medium">差別化軸：</span>{t.value.differentiator}
+                  </p>
+                )}
+                {t.tags && t.tags.length > 0 && (
+                  <div className="flex flex-wrap gap-1 mt-2">
+                    {t.tags.slice(0, 3).map(tag => <TagChip key={tag} tag={tag} />)}
+                    {t.tags.length > 3 && <span className="text-xs text-stone-500">+{t.tags.length - 3}</span>}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -823,7 +1053,11 @@ function DetailView({ term, allTags, useWebSearch, onBack, onUpdate, onDelete })
       <div className="mb-6">
         <CategoryBadge category={term.category} />
         <h2 className="text-4xl text-stone-900 mt-2 mb-1 serif">{term.name}</h2>
-        <p className="text-sm text-stone-500 mb-4">{term.reading}</p>
+        <p className="text-sm text-stone-500 mb-3">{term.reading}</p>
+        <div className="mb-3 p-3 bg-stone-50 border border-stone-200 rounded inline-flex items-center gap-3">
+          <span className="text-xs text-stone-600 font-medium">習熟度：</span>
+          <MasteryStars value={term.mastery || 0} onChange={(m) => onUpdate({ ...term, mastery: m })} />
+        </div>
         <div className="max-w-2xl">
           <TagInput tags={term.tags || []} onChange={(tags) => onUpdate({ ...term, tags })} allTags={allTags} />
         </div>
@@ -1165,7 +1399,9 @@ function App() {
           <PortfolioView terms={terms}
             onSelect={(id) => { setSelectedId(id); setView("detail"); }}
             onAddNew={() => setView("add")}
-            onSeed={() => setView("seed")} />
+            onSeed={() => setView("seed")}
+            onUpdateOrder={(reordered) => updateTerms(reordered)}
+            onDelete={handleDelete} />
         )}
         {view === "detail" && selectedTerm && (
           <DetailView term={selectedTerm} allTags={allTags} useWebSearch={useWebSearch}
